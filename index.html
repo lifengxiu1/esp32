@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>ESP32 RGB 状态 + 控制台</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<style>
+  /* 白底黑字，红/白方块 */
+  :root { color-scheme: light; }
+  body { background:#fff; color:#111; font:14px/1.5 system-ui,Segoe UI,Arial; margin:20px; }
+  header { display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }
+  h1 { margin:0; font-size:18px; }
+  #status { font-size:12px; padding:2px 8px; border-radius:999px; background:#eee; }
+  #status.ok { background:#e6ffed; color:#065f46; }
+  #status.err{ background:#fee2e2; color:#991b1b; }
+
+  .bar { display:flex; gap:18px; align-items:center; flex-wrap:wrap; margin:12px 0 16px; }
+  .kpi { font-weight:600; }
+  .mono { font-family:ui-monospace,Consolas,monospace; }
+
+  .panel { border:1px solid #e5e7eb; border-radius:10px; padding:12px; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.04); margin-bottom:14px;}
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:end; }
+  label { font-size:12px; color:#444; display:flex; flex-direction:column; gap:6px; }
+  input[type=number]{ width:90px; padding:6px 8px; border:1px solid #ddd; border-radius:8px; }
+  button{ padding:8px 12px; border:1px solid #ddd; border-radius:8px; background:#fff; cursor:pointer; }
+  button:hover{ background:#f3f4f6; }
+
+  table { width:100%; border-collapse:collapse; table-layout:fixed; }
+  thead th { text-align:left; font-weight:600; border-bottom:2px solid #111; padding:6px 4px; }
+  tbody td { border-bottom:1px dashed #ddd; padding:8px 4px; vertical-align:middle; }
+  .idcol { width:80px; }
+  .scol  { width:56px; }
+  .tcol  { width:120px; }
+  .dot { display:inline-block; width:16px; height:16px; border:1px solid #111; border-radius:2px; background:#fff; vertical-align:middle; }
+  .dot.on { background:#ff3b30; } /* 红色=亮 */
+  .hint { font-size:12px; color:#666; }
+
+  .two-col { columns: 2; column-gap: 24px; } /* 可选：把亮灯列表分两列显示（移动端会自动叠放） */
+  .card { break-inside: avoid; border-bottom:1px dashed #ddd; padding:6px 0; }
+  .card .ttl{ display:flex; align-items:center; gap:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ESP32 RGB 状态 + 控制台</h1>
+  <span id="status">未连接</span>
+</header>
+
+<div class="bar">
+  <div class="kpi">空余灯数量：<span id="free">-</span> / <span id="total">74</span></div>
+  <div class="hint">仅显示点亮的灯（红方块），数据来自 <b>rgb/ack</b>；下发命令到 <b>rgb/ctrl</b>。</div>
+</div>
+
+<!-- 控制面板 -->
+<section class="panel">
+  <div class="row">
+    <label>编号（1..74）：
+      <input type="number" id="id" min="1" max="74" placeholder="1..74" />
+    </label>
+    <label>时长（小时）：
+      <input type="number" id="h" min="0" max="240" value="0" />
+    </label>
+    <label>时长（分钟）：
+      <input type="number" id="m" min="0" max="59" value="10" />
+    </label>
+    <div class="row" style="gap:8px">
+      <button onclick="onOne()">亮 指定</button>
+      <button onclick="offOne()">灭 指定</button>
+      <button onclick="allOn()">全亮（用上述时长，0则常亮）</button>
+      <button onclick="allOff()">全灭</button>
+    </div>
+  </div>
+  <div class="hint">说明：编号按人类习惯 1..74，设备下行使用 <span class="mono">pixel</span>（0基）。时长仅含小时和分钟，若均为 0 表示常亮（不带秒）。</div>
+</section>
+
+<!-- 亮灯列表（仅显示 on=1 的灯） -->
+<section class="panel">
+  <div class="row" style="justify-content:space-between; width:100%">
+    <div class="hint">当前点亮列表（只显示 on=1）</div>
+    <div class="hint">最后更新：<span id="ts">--</span></div>
+  </div>
+
+  <!-- 方式 A：表格风格（默认开启） -->
+  <table id="tbl">
+    <thead><tr>
+      <th class="idcol">编号</th>
+      <th class="scol">状态</th>
+      <th class="tcol">剩余时间</th>
+      <th>说明</th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+  <!-- 方式 B（可切换）：两列卡片风格 -->
+  <!--
+  <div id="cards" class="two-col"></div>
+  -->
+</section>
+
+<script>
+  /* === 改成你的 WebSockets 地址 ===
+     同机浏览器： ws://127.0.0.1:9001
+     另一台电脑： ws://192.168.158.148:9001
+  */
+  const BROKER_WS = "ws://127.0.0.1:9001";
+  const TOPIC_UP   = "rgb/ack";
+  const TOPIC_DOWN = "rgb/ctrl";
+  const N = 74;
+
+  // 状态数组：index 0..73，对应编号 1..74
+  const state = Array.from({length:N}, (_,i)=>({ id:i+1, on:0, remain_ms:null }));
+
+  // 工具：格式化剩余时间（到秒）
+  function fmtHMS(ms){
+    if(ms==null || ms<=0) return "";
+    const totalSec = Math.ceil(ms/1000);
+    const h = Math.floor(totalSec/3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    // h>0 时显示 H:MM:SS，否则显示 MM:SS
+    return (h>0 ? `${h}:` : '') + `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  }
+  function nowStr(){ const d=new Date(); return d.toLocaleTimeString(); }
+
+  // 渲染（只显示 on=1 的灯）
+  const tbody = document.getElementById('tbody');
+  const freeEl = document.getElementById('free');
+  const totalEl = document.getElementById('total');
+  const tsEl = document.getElementById('ts');
+  totalEl.textContent = N;
+
+  function render(){
+    const onList = state.filter(s=>s.on);
+    const free = N - onList.length;
+    freeEl.textContent = free;
+    tsEl.textContent = nowStr();
+
+    // 表格渲染（仅 on=1）
+    tbody.innerHTML = "";
+    for(const s of onList){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="idcol mono">#${String(s.id).padStart(2,"0")}</td>
+        <td class="scol"><span class="dot on" title="ON"></span></td>
+        <td class="tcol mono">${fmtHMS(s.remain_ms)}</td>
+        <td class="mono">ON</td>
+      `;
+      tbody.appendChild(tr);
+    }
+
+    // // 卡片渲染（如果想用卡片风格，把上面的表格注释掉，打开下行）
+     // const cards = document.getElementById('cards');
+     // cards.innerHTML = "";
+     // for(const s of onList){
+     //   const div = document.createElement('div');
+     //   div.className = "card";
+     //   div.innerHTML = `
+     //     <div class="ttl"><span class="dot on"></span>
+     //       <b>#${String(s.id).padStart(2,"0")}</b> &nbsp;剩余：<span class="mono">${fmtHMS(s.remain_ms)||"-"}</span>
+     //     </div>`;
+     //   cards.appendChild(div);
+     // }
+  }
+
+  // MQTT 连接
+  const statusEl = document.getElementById('status');
+  const clientId = "web-" + Math.random().toString(16).slice(2,8);
+  const client = mqtt.connect(BROKER_WS, { keepalive:30, clientId, reconnectPeriod:2000 });
+
+  client.on('connect', ()=>{
+    statusEl.textContent = `已连接：${BROKER_WS}（clientId=${clientId}）`;
+    statusEl.className = "ok";
+    client.subscribe(TOPIC_UP, {qos:1}, (err)=>{
+      if(err){ statusEl.textContent="订阅失败"; statusEl.className="err"; }
+    });
+  });
+  client.on('reconnect', ()=>{ statusEl.textContent="重连中…"; statusEl.className=""; });
+  client.on('error', (e)=>{ statusEl.textContent="连接错误（见控制台）"; statusEl.className="err"; console.error(e); });
+
+  client.on('message', (topic, payload)=>{
+    if(topic !== TOPIC_UP) return;
+    try{
+      const j = JSON.parse(payload.toString());
+      if(Array.isArray(j.lights)){
+        for(const it of j.lights){
+          const id = it.id|0; if(id<1 || id>N) continue;
+          const idx = id-1;
+          state[idx].on = it.on?1:0;
+          state[idx].remain_ms = (it.remain_ms==null)? null : (it.remain_ms|0);
+        }
+        render();
+      }
+    }catch(e){
+      console.warn("ACK 解析失败：", e);
+    }
+  });
+
+  // 下发控制（页面按钮）
+  function getDurationMs(){
+    const h = Math.max(0, parseInt(document.getElementById('h').value || "0", 10));
+    const m = Math.max(0, parseInt(document.getElementById('m').value || "0", 10));
+    const totalMs = (h*60 + m) * 60 * 1000;
+    return totalMs; // 0 表示常亮
+  }
+  function humanIdToPixel(id){
+    const n = parseInt(id,10);
+    if(!n || n<1 || n>N) return null;
+    return n-1; // 0 基 pixel
+  }
+  function publish(obj){
+    const s = JSON.stringify(obj);
+    client.publish(TOPIC_DOWN, s, { qos:1 }, (err)=>{
+      if(err) alert("发送失败：" + err);
+    });
+  }
+
+  window.onOne = ()=>{
+    const id = document.getElementById('id').value;
+    const pixel = humanIdToPixel(id);
+    if(pixel==null){ alert("请输入 1..74 的编号"); return; }
+    const ms = getDurationMs(); // 0 = 常亮
+    const payload = { cmd:"set", effect:"solid", pixel, duration_ms: ms };
+    publish(payload);
+  };
+  window.offOne = ()=>{
+    const id = document.getElementById('id').value;
+    const pixel = humanIdToPixel(id);
+    if(pixel==null){ alert("请输入 1..74 的编号"); return; }
+    publish({ cmd:"set", effect:"off", pixel });
+  };
+  window.allOn = ()=>{
+    const ms = getDurationMs();
+    const payload = ms>0 ? { cmd:"set", effect:"solid", duration_ms: ms }
+                         : { cmd:"set", effect:"solid" }; // 0 则不带时长=常亮
+    publish(payload);
+  };
+  window.allOff = ()=> publish({ cmd:"set", effect:"off" });
+
+  // 初始渲染
+  render();
+</script>
+</body>
+</html>

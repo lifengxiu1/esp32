@@ -1,0 +1,31 @@
+menu "RGB Minimal Config"
+
+config RGBMIN_WIFI_SSID
+    string "WiFi SSID"
+    default "YOUR_SSID"
+
+config RGBMIN_WIFI_PASS
+    string "WiFi Password"
+    default "YOUR_PASS"
+
+config RGBMIN_MQTT_URI
+    string "MQTT broker URI"
+    default "mqtt://192.168.1.10"
+
+config RGBMIN_MQTT_SUB
+    string "Downlink topic"
+    default "rgb/ctrl"
+
+config RGBMIN_MQTT_PUB
+    string "Uplink topic"
+    default "rgb/ack"
+
+config RGBMIN_WS2812_GPIO
+    int "WS2812 data GPIO"
+    default 38
+
+config RGBMIN_WS2812_COUNT
+    int "WS2812 LED count"
+    default 74
+
+endmenu
